@@ -18,7 +18,7 @@ Piano Simulation 是一个基于 **Rust** 实现的钢琴声学仿真与声音�
 - 在物理层，使用有限差分时域法（FDTD）对包含刚度项与频率相关阻尼项的刚性弦振动方程进行数值求解，以复现钢琴弦的非谐性泛音结构与击弦动态；
 - 在工程层，引入高保真采样数据，用于补偿物理模型在高频瞬态与质感细节上的不足。
 
-演示视频  y[https://github.com/jsjs66-hub/Piano-Simulation/blob/main/%E6%BC%94%E7%A4%BA/1%E6%9C%884%E6%97%A5.mp4
+演示视频  [https://github.com/jsjs66-hub/Piano-Simulation/blob/main/%E6%BC%94%E7%A4%BA/1%E6%9C%884%E6%97%A5.mp4
 ](https://github.com/jsjs66-hub/Piano-Simulation/issues/1#issue-3778904940)---
 
 ## 主要特性
