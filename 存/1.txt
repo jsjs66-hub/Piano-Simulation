@@ -1,0 +1,273 @@
+/* 
+   Project: Piano Performance Simulation (Polyphonic)
+   Based on: Chaigne & Askenfelt Model
+   Language: Rust
+   Dependencies: hound (for WAV export)
+*/
+
+use std::f64::consts::PI;
+use hound; // 确保在Cargo.toml中添加 hound = "3.5.0"
+
+// --- 物理常数 ---
+const E_STEEL: f64 = 2.0e11;       // 钢的杨氏模量 (Pa)
+const RHO_STEEL: f64 = 7850.0;     // 钢的密度 (kg/m^3)
+// 为了简化，我们假设所有弦都是钢丝，实际低音弦有缠绕铜丝，这里通过调整线密度模拟
+const TENSION_BASE: f64 = 670.0;   // 基础张力 (N) - 实际钢琴张力随音高变化不大
+const HAMMER_MASS_BASE: f64 = 0.006; // 基础琴槌质量
+const HAMMER_K: f64 = 1.0e9;       // 琴槌刚度
+const HAMMER_P: f64 = 2.5;         // 非线性指数
+
+// --- 仿真设置 ---
+const FS_AUDIO: f64 = 44100.0;     // 音频采样率
+const OVERSAMPLE: usize = 8;       // 过采样倍数 (用于保证物理稳定性)
+const DT_PHY: f64 = 1.0 / (FS_AUDIO * OVERSAMPLE as f64);
+
+// 表示一个音符事件
+struct NoteEvent {
+    key_index: usize, // 0 to 87 (A0 to C8)
+    start_time: f64,  // 秒
+    duration: f64,    // 秒
+    velocity: f64,    // 击弦速度 (m/s)
+}
+
+struct PianoString {
+    y_curr: Vec<f64>,
+    y_prev: Vec<f64>,
+    y_next: Vec<f64>,
+    length: f64,
+    dx: f64,
+    // 预计算系数
+    c1: f64, c2: f64, c3: f64, c4: f64, c5: f64, 
+    loss_factor: f64,
+    
+    // 琴槌状态
+    hammer_pos: f64,
+    hammer_vel: f64,
+    hammer_mass: f64,
+    is_hammer_active: bool,
+    strike_idx: usize,
+}
+
+impl PianoString {
+    // 初始化一根特定的弦 (key_index: 0=A0, 49=A4=440Hz)
+    fn new(key_index: usize) -> Self {
+        // 1. 计算该键的基本物理参数
+        // 频率公式: f = 440 * 2^((n-49)/12)
+        let freq = 440.0 * 2.0f64.powf((key_index as f64 - 49.0) / 12.0);
+        
+        // 简化模型：通过频率反推弦长 (假设张力和密度恒定，忽略刚度对基频的微小影响)
+        // f = c / 2L => L = c / 2f. c = sqrt(T/rho_L)
+        // 假设一根典型的中音区弦 r=0.5mm
+        let radius = 0.0005; 
+        let area = PI * radius * radius;
+        let rho_l = RHO_STEEL * area; 
+        let c_wave = (TENSION_BASE / rho_l).sqrt();
+        let length = c_wave / (2.0 * freq);
+
+        // 刚度系数 kappa = E*I / rho_L
+        let moment_inertia = PI * radius.powi(4) / 4.0;
+        let kappa = (E_STEEL * moment_inertia) / rho_l;
+
+        // 阻尼系数 (随频率增加)
+        let b1 = 0.5; 
+        let b2 = 1.0e-5; // 稍作调整以适应高频
+
+        // 2. 网格初始化
+        // 必须满足稳定性条件: dx 必须足够小以支持剛度引起的快速波
+        // 稳定性近似: dt < h^2 / sqrt(4*kappa + c^2*h^2)
+        // 这里我们反过来，根据 DT_PHY 确定需要的最小 dx
+        // 简化的安全 dx 选择: 
+        let min_dx = (2.0 * kappa.sqrt() * DT_PHY).sqrt() * 1.5; // 粗略估算
+        let nx = (length / min_dx).ceil() as usize;
+        let dx = length / nx as f64;
+
+        // 3. 计算FDTD系数
+        let r = c_wave * DT_PHY / dx;
+        let mu = (kappa * DT_PHY * DT_PHY) / dx.powi(4);
+        let coeff_b1 = b1 * DT_PHY;
+        let coeff_b2 = 2.0 * b2 * DT_PHY / dx.powi(2);
+        
+        let inv_denom = 1.0 / (1.0 + coeff_b1);
+
+        // 系数对应方程: y_next = [ (2-2r^2-6mu-4b2)*y_c +... ] / (1+b1)
+        // 这里使用更直接的展开形式
+        
+        PianoString {
+            y_curr: vec![0.0; nx],
+            y_prev: vec![0.0; nx],
+            y_next: vec![0.0; nx],
+            length,
+            dx,
+            // 存储物理参数供 update 使用
+            c1: r*r, 
+            c2: mu,
+            c3: coeff_b1,
+            c4: coeff_b2,
+            c5: inv_denom,
+            loss_factor: 1.0, // 初始无损
+            
+            hammer_pos: 0.0,
+            hammer_vel: 0.0,
+            hammer_mass: HAMMER_MASS_BASE * (1.0 - key_index as f64 * 0.005), // 高音琴槌轻一些
+            is_hammer_active: false,
+            strike_idx: (0.12 * nx as f64) as usize, // 击弦点在 1/8 处
+        }
+    }
+
+    fn strike(&mut self, velocity: f64) {
+        self.hammer_pos = 0.0; // 假设从接触点开始
+        self.hammer_vel = velocity;
+        self.is_hammer_active = true;
+    }
+
+    fn step(&mut self) -> f64 {
+        let nx = self.y_curr.len();
+        let mut hammer_force = 0.0;
+
+        // --- 1. 计算琴槌力 ---
+        if self.is_hammer_active {
+            let string_disp = self.y_curr[self.strike_idx];
+            let compression = self.hammer_pos - string_disp;
+            
+            if compression > 0.0 {
+                hammer_force = HAMMER_K * compression.powf(HAMMER_P);
+            } else {
+                // 琴槌离开弦
+                if self.hammer_pos < -0.001 { // 简单判定离开
+                    self.is_hammer_active = false;
+                }
+            }
+
+            // 更新琴槌 (半隐式欧拉)
+            let accel = -hammer_force / self.hammer_mass;
+            self.hammer_vel += accel * DT_PHY;
+            self.hammer_pos += self.hammer_vel * DT_PHY;
+        }
+
+        // --- 2. 更新弦 (内部点) ---
+        // 边界条件: i=0 和 i=NX-1 固定为0 (简支端近似)
+        // 优化：不使用 ghost points 数组，直接在循环中处理索引
+        
+        for i in 2..nx-2 {
+            let dxx = self.y_curr[i+1] - 2.0*self.y_curr[i] + self.y_curr[i-1];
+            let dxxxx = self.y_curr[i+2] - 4.0*self.y_curr[i+1] + 6.0*self.y_curr[i] 
+                        - 4.0*self.y_curr[i-1] + self.y_curr[i-2];
+            
+            let v_xx = (self.y_curr[i+1] - 2.0*self.y_curr[i] + self.y_curr[i-1]) 
+                     - (self.y_prev[i+1] - 2.0*self.y_prev[i] + self.y_prev[i-1]);
+
+            let mut force_term = 0.0;
+            if i == self.strike_idx {
+                // F = ma -> a = F/rho*dx.  term = a * dt^2
+                // Force needs to be force density or handled as discrete force
+                // Discrete force contribution: F * dt^2 / (rho * dx)
+                // rho_linear = T / c^2. 
+                // Let's approximate mass_segment
+                let mass_segment = (TENSION_BASE / (self.length/DT_PHY).powi(2)) * self.dx; // 粗略
+                // 更准确: mass_segment = rho_L * dx
+                let area = PI * 0.0005*0.0005;
+                let mass_seg = RHO_STEEL * area * self.dx;
+                force_term = (hammer_force / mass_seg) * DT_PHY.powi(2);
+            }
+
+            // 刚性弦方程离散形式
+            // y_new = [2y - y_old*(1-b1) + r^2*dxx - mu^2*dxxxx + b2*v_xx + force] / (1+b1)
+            
+            let numerator = 2.0 * self.y_curr[i] 
+                          - self.y_prev[i] * (1.0 - self.c3)
+                          + self.c1 * dxx 
+                          - self.c2 * dxxxx 
+                          + self.c4 * v_xx
+                          + force_term;
+            
+            self.y_next[i] = numerator * self.c5;
+        }
+
+        // 更新状态
+        // swap buffers: prev <- curr, curr <- next
+        self.y_prev.copy_from_slice(&self.y_curr);
+        self.y_curr.copy_from_slice(&self.y_next);
+
+        // 返回拾音器位置的采样 (假设在琴码附近)
+        self.y_curr[(nx as f64 * 0.85) as usize]
+    }
+}
+
+fn main() {
+    // 乐谱：(Key Index relative to A0, Start Time, Duration, Velocity)
+    // C Major Arpeggio: C4(39), E4(43), G4(46), C5(51)
+    let score = vec![
+        NoteEvent { key_index: 39, start_time: 0.0, duration: 2.0, velocity: 3.0 }, // C4
+        NoteEvent { key_index: 43, start_time: 0.2, duration: 1.8, velocity: 2.5 }, // E4
+        NoteEvent { key_index: 46, start_time: 0.4, duration: 1.6, velocity: 2.5 }, // G4
+        NoteEvent { key_index: 51, start_time: 0.6, duration: 1.4, velocity: 4.0 }, // C5
+    ];
+
+    let total_time = 3.0; // 秒
+    let total_samples = (total_time * FS_AUDIO) as usize;
+    let mut mixed_output = vec![0.0; total_samples];
+
+    println!("Initializing strings...");
+    // 为乐谱中出现的每个音符创建一根弦
+    // 实际应用中会创建一个完整的 Piano 结构体包含88根弦
+    let mut active_strings: Vec<(PianoString, usize, f64)> = score.iter().map(|note| {
+        (PianoString::new(note.key_index), note.key_index, note.velocity)
+    }).collect();
+
+    println!("Simulating performance...");
+    
+    // 主时间循环
+    let mut sample_idx = 0;
+    let mut phys_time = 0.0;
+    
+    while sample_idx < total_samples {
+        // 物理过采样循环
+        for _ in 0..OVERSAMPLE {
+            // 检查是否有音符触发
+            for (i, note) in score.iter().enumerate() {
+                if (phys_time - note.start_time).abs() < DT_PHY / 2.0 {
+                    // 触发对应的弦
+                    // 简单起见，这里我们假设 active_strings 的顺序和 score 一致
+                    active_strings[i].0.strike(note.velocity);
+                    println!("Strike key {} at {:.2}s", note.key_index, phys_time);
+                }
+            }
+
+            // 更新所有弦
+            let mut sum_sample = 0.0;
+            for (string, _, _) in active_strings.iter_mut() {
+                sum_sample += string.step();
+            }
+
+            // 下采样：仅在特定时刻记录
+            // 简单的抽取 (Decimation)，更好的做法是低通滤波后抽取
+            if (phys_time * FS_AUDIO).fract() < (DT_PHY * FS_AUDIO) {
+                if sample_idx < total_samples {
+                    mixed_output[sample_idx] = sum_sample;
+                    sample_idx += 1;
+                }
+            }
+            phys_time += DT_PHY;
+        }
+    }
+
+    // 归一化并写入 WAV
+    let max_amp = mixed_output.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+    println!("Max amplitude: {}", max_amp);
+    
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: FS_AUDIO as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create("piano_performance.wav", spec).unwrap();
+    let volume_scale = 0.8 / max_amp; // 留一点余量
+
+    for sample in mixed_output {
+        let amp = (sample * volume_scale * 32767.0) as i16;
+        writer.write_sample(amp).unwrap();
+    }
+
+    println!("Done! Output saved to piano_performance.wav");
+}

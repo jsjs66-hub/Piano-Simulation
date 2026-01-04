@@ -1,0 +1,11 @@
+[package]
+name = "piano_sim_phys"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4"
+rodio = "0.17"
+midly = "0.5"
+rfd = "0.12" 
+rand = "0.8" # 新增 rand 用于生成噪声
